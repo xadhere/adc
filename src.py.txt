@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+树莓派智能跟随 - 综合优化版（带蓝牙手机控制 + 报警功能）
+特点：
+- 摄像头曝光优化（避免过曝，提升暗部）
+- 目标丢失立即停止（无虚线）
+- 可选图像预处理增强（CLAHE/伽马校正）
+- 保留多目标跟踪、比例转向、Flask显示
+- 蓝牙手机控制：模式切换、手动指令、电量查询
+- 报警功能：手动超时、超声波障碍物接近
+"""
+
+from flask import Flask, Response, render_template_string
+import cv2
+import threading
+import time
+import serial
+import numpy as np
+import subprocess
+import queue
+from ultralytics import YOLO
+
+# ==================== 配置参数（请根据实际修改）====================
+MODEL_PATH = "/home/pi/yolov8n_ncnn_model"          # NCNN模型文件夹
+# 如不使用自定义跟踪器，请将下一行注释掉
+TRACKER_CFG = "/home/pi/my_bytetrack.yaml"
+
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+INPUT_SIZE = 320                                    # 模型输入尺寸
+CAMERA_FPS = 30
+CAMERA_BUFFERSIZE = 1
+
+CONF_THRESH = 0.25                                   # 检测置信度
+IOU_THRESH = 0.6                                     # NMS阈值
+MAX_MISSED_FRAMES = 60                               # 目标最大丢失帧数
+
+# 比例转向参数（可根据需要调整）
+DEAD_ZONE = 10
+MAX_OFFSET = 200
+MAX_DIFF = 210
+BASE_SPEED = 210
+
+# 动态推理间隔
+FRAME_SKIP_IDLE = 5
+FRAME_SKIP_TRACK = 1
+
+# 下位机串口（控制小车，并接收传感器数据）
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUDRATE = 9600
+
+# 蓝牙串口（由系统 rfcomm 服务提供）
+BT_SERIAL_PORT = "/dev/rfcomm0"
+BT_BAUDRATE = 9600
+
+# 视频流
+JPEG_QUALITY = 35
+STREAM_SLEEP = 0.05
+
+# 图像增强开关（True 启用，False 禁用）
+ENABLE_ENHANCE = True   # 启用后可改善低光识别，但会增加CPU负载
+ENHANCE_METHOD = "gamma"  # "gamma" 或 "clahe"
+GAMMA = 1.3              # 伽马值 >1 变亮
+CLAHE_CLIP = 2.0         # CLAHE 对比度限制
+
+# ==================== 摄像头曝光优化参数（自动模式）====================
+CAMERA_SETTINGS = {
+    "auto_exposure": 3,              # 自动曝光模式（3=光圈优先）
+    "backlight_compensation": 1,      # 背光补偿（1=开启）
+    "brightness": 15,                 # 亮度（适当降低，避免过曝）
+    "contrast": 200,                  # 对比度（适当降低，减少高光）
+    "gamma": 18,                      # 伽马值（恢复默认，通过软件增强）
+    "gain": 4,                        # 增益
+    "saturation": 300                  # 饱和度
+}
+
+# ==================== 报警参数 ====================
+MANUAL_TIMEOUT_SEC = 30                 # 手动模式超时时间（秒），超时后自动切回自动模式并报警
+ULTRASONIC_ALARM_DISTANCE = 30          # 超声波报警距离（厘米），低于此值触发报警
+ULTRASONIC_ALARM_COOLDOWN = 5           # 超声波报警最小间隔（秒）
+# ===================================================================
+
+# ---------- 模式定义 ----------
+MODE_AUTO = 1
+MODE_MANUAL = 2
+current_mode = MODE_AUTO   # 默认为自动模式
+
+# ---------- 传感器数据 ----------
+battery_voltage = None      # 最新从下位机读取的电压值
+ultrasonic_distance = None  # 最新从下位机读取的超声波距离（厘米）
+
+# ---------- 蓝牙命令队列 ----------
+bt_cmd_queue = queue.Queue()
+
+# ---------- 报警状态 ----------
+last_manual_cmd_time = time.time()      # 最后一次手动指令接收时间
+manual_timeout_alarm_triggered = False  # 手动超时是否已报警（用于防止重复报警）
+last_ultrasonic_alarm_time = 0          # 上次超声波报警时间（秒）
+
+# ---------- 应用摄像头参数 ----------
+def apply_camera_settings():
+    """使用v4l2-ctl设置摄像头参数（需安装v4l-utils）"""
+    try:
+        for ctrl, value in CAMERA_SETTINGS.items():
+            subprocess.run(
+                ["v4l2-ctl", "-d", "/dev/video0", "--set-ctrl", f"{ctrl}={value}"],
+                check=False, capture_output=True
+            )
+        print("✅ 摄像头参数已应用")
+    except Exception as e:
+        print(f"⚠️ 摄像头参数设置失败: {e}")
+
+# ---------- 图像增强函数 ----------
+def enhance_image(img):
+    """对图像进行预处理增强，改善低光识别"""
+    if not ENABLE_ENHANCE:
+        return img
+    if ENHANCE_METHOD == "gamma":
+        # 伽马校正
+        gamma = GAMMA
+        lookup = np.array([(i / 255.0) ** (1/gamma) * 255 for i in range(256)]).astype('uint8')
+        return cv2.LUT(img, lookup)
+    elif ENHANCE_METHOD == "clahe":
+        # CLAHE 增强局部对比度
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        lab = cv2.merge([l, a, b])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return img
+
+# ---------- 下位机串口 ----------
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+    print(f"✅ 下位机串口 {SERIAL_PORT} 打开成功")
+except Exception as e:
+    print(f"❌ 下位机串口打开失败: {e}")
+    ser = None
+
+# ---------- 蓝牙串口（初始尝试打开，可能失败） ----------
+bt_ser = None
+try:
+    bt_ser = serial.Serial(BT_SERIAL_PORT, BT_BAUDRATE, timeout=1)
+    print(f"✅ 蓝牙串口 {BT_SERIAL_PORT} 打开成功")
+except Exception as e:
+    print(f"⚠️ 蓝牙串口打开失败: {e}（手机未连接时正常）")
+
+# ---------- 模型 ----------
+print("正在加载NCNN模型...")
+model = YOLO(MODEL_PATH)
+print("✅ NCNN模型加载成功")
+
+# ---------- Flask ----------
+app = Flask(__name__)
+frame_lock = threading.Lock()
+current_frame = None
+current_cmd_display = "S"
+
+# 跟踪状态
+target_id = None
+target_lost_frames = 0
+last_boxes = []          # 当前目标框（用于绘制和指令）
+last_scores = []
+all_boxes = []           # 所有检测框（用于显示）
+all_scores = []
+prev_target_box = None   # 上一帧目标框（仅用于绘制虚线，但这里我们不再绘制）
+
+# ---------- 工具函数 ----------
+def send_command(cmd_str):
+    """向下位机发送指令"""
+    if ser and ser.is_open:
+        try:
+            ser.write((cmd_str + '\n').encode())
+        except Exception as e:
+            print(f"串口发送错误: {e}")
+
+def send_bt_response(msg):
+    """通过蓝牙向手机发送响应"""
+    global bt_ser
+    if bt_ser and bt_ser.is_open:
+        try:
+            bt_ser.write((msg + '\n').encode())
+        except Exception as e:
+            print(f"蓝牙发送错误: {e}")
+
+def select_target_from_boxes(boxes, confs, ids, frame_center_x):
+    if len(boxes) == 0:
+        return None
+    centers = (boxes[:, 0] + boxes[:, 2]) / 2
+    distances = np.abs(centers - frame_center_x)
+    sorted_idx = np.argsort(distances)
+    return ids[sorted_idx[0]]
+
+def calculate_command(boxes, frame_center_x):
+    if boxes is None or len(boxes) == 0:
+        return 'S', 0
+    if isinstance(boxes, np.ndarray):
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        idx = np.argmax(areas)
+        largest_box = boxes[idx]
+    else:
+        largest_box = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+    x1, y1, x2, y2 = largest_box
+    person_center_x = (x1 + x2) // 2
+    offset = person_center_x - frame_center_x
+    if abs(offset) < DEAD_ZONE:
+        return 'F', BASE_SPEED
+    abs_offset = min(abs(offset), MAX_OFFSET)
+    diff = int(MAX_DIFF * abs_offset / MAX_OFFSET)
+    return ('L', diff) if offset < 0 else ('R', diff)
+
+def process_bluetooth_command(cmd):
+    global current_mode, CONF_THRESH, BASE_SPEED, battery_voltage
+    global last_manual_cmd_time, manual_timeout_alarm_triggered
+    cmd = cmd.strip()
+    if not cmd:
+        return
+
+    print(f"📱 处理蓝牙指令: {cmd}")
+
+    # 简化模式切换：1=手动，2=自动
+    if cmd == "1":
+        current_mode = MODE_MANUAL
+        last_manual_cmd_time = time.time()      # <-- 重置计时器
+        manual_timeout_alarm_triggered = False
+        print("切换到手动控制模式")
+    elif cmd == "2":
+        current_mode = MODE_AUTO
+        print("切换到自动跟随模式")
+    # 手动控制指令（仅当处于手动模式）
+    elif current_mode == MODE_MANUAL and cmd[0] in ('F','B','L','R','S') and len(cmd) > 1:
+        send_command(cmd)
+        print(f"手动指令已发送: {cmd}")
+        last_manual_cmd_time = time.time()          # 更新最后指令时间
+        manual_timeout_alarm_triggered = False      # 重置超时报警标志
+    # 其他未知指令
+    else:
+        print(f"未知指令或模式不匹配: {cmd}")
+
+def read_bt_commands():
+    """独立线程：持续读取蓝牙串口，将收到的指令放入队列"""
+    global bt_ser
+    while True:
+        # 如果蓝牙串口未打开或已断开，尝试重新打开
+        if bt_ser is None or not bt_ser.is_open:
+            try:
+                bt_ser = serial.Serial(BT_SERIAL_PORT, BT_BAUDRATE, timeout=1)
+                print("✅ 蓝牙串口重新连接成功")
+            except Exception as e:
+                # 没有手机连接时正常，等待2秒后重试
+                time.sleep(2)
+                continue
+
+        try:
+            # 读取一行（以换行符结尾）
+            line = bt_ser.readline().decode().strip()
+            if line:
+                bt_cmd_queue.put(line)
+        except Exception as e:
+            print(f"蓝牙读取错误: {e}，尝试重新打开串口")
+            try:
+                bt_ser.close()
+            except:
+                pass
+            bt_ser = None
+            time.sleep(1)
+
+def capture_frames():
+    global current_frame, current_cmd_display, last_boxes, last_scores, all_boxes, all_scores
+    global target_id, target_lost_frames, prev_target_box
+    global current_mode, battery_voltage, ultrasonic_distance
+    global manual_timeout_alarm_triggered, last_ultrasonic_alarm_time
+
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFERSIZE)
+
+    if not cap.isOpened():
+        print("❌ 无法打开摄像头")
+        return
+
+    # 应用摄像头优化参数
+    apply_camera_settings()
+    time.sleep(0.5)
+
+    print("🚀 采集线程启动 - 综合优化版（带蓝牙+报警）")
+    frame_count = 0
+    frame_center_x = CAMERA_WIDTH // 2
+
+    while True:
+        current_time = time.time()
+
+        # ---------- 处理蓝牙指令（非阻塞）----------
+        try:
+            while True:  # 一次性处理队列中所有指令
+                cmd = bt_cmd_queue.get_nowait()
+                process_bluetooth_command(cmd)
+        except queue.Empty:
+            pass
+
+        # ---------- 摄像头采集 ----------
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.01)
+            continue
+
+        frame_count += 1
+
+        # 图像增强（可选）
+        if ENABLE_ENHANCE:
+            enhanced_frame = enhance_image(frame)
+        else:
+            enhanced_frame = frame
+
+        # 动态推理间隔
+        interval = FRAME_SKIP_IDLE if len(last_boxes) == 0 else FRAME_SKIP_TRACK
+        do_inference = (frame_count % interval == 0)
+
+        if do_inference:
+            results = model.track(enhanced_frame,
+                                  imgsz=INPUT_SIZE,
+                                  conf=CONF_THRESH,
+                                  iou=IOU_THRESH,
+                                  classes=[0],
+                                  persist=True,
+                                  tracker=TRACKER_CFG,
+                                  verbose=False)
+
+            if results[0].boxes is not None and len(results[0].boxes) > 0:
+                boxes_xyxy = results[0].boxes.xyxy.cpu().numpy().astype(int)
+                confs = results[0].boxes.conf.cpu().numpy()
+                all_boxes = boxes_xyxy
+                all_scores = confs
+
+                if results[0].boxes.id is not None:
+                    ids = results[0].boxes.id.cpu().numpy().astype(int)
+
+                    if target_id is None:
+                        target_id = select_target_from_boxes(boxes_xyxy, confs, ids, frame_center_x)
+                        if target_id is not None:
+                            print(f"🎯 选定目标 ID: {target_id}")
+                            target_lost_frames = 0
+                            for i, tid in enumerate(ids):
+                                if tid == target_id:
+                                    last_boxes = np.array([boxes_xyxy[i]])
+                                    last_scores = np.array([confs[i]])
+                                    prev_target_box = last_boxes[0]
+                                    break
+                    else:
+                        if target_id in ids:
+                            target_lost_frames = 0
+                            target_boxes = []
+                            target_confs = []
+                            for i, tid in enumerate(ids):
+                                if tid == target_id:
+                                    target_boxes.append(boxes_xyxy[i])
+                                    target_confs.append(confs[i])
+                            last_boxes = np.array(target_boxes)
+                            last_scores = np.array(target_confs)
+                            prev_target_box = last_boxes[0]
+                        else:
+                            target_lost_frames += 1
+                            last_boxes = []
+                            print(f"⚠️ 目标丢失，累计 {target_lost_frames}/{MAX_MISSED_FRAMES}")
+                            if target_lost_frames > MAX_MISSED_FRAMES:
+                                new_id = select_target_from_boxes(boxes_xyxy, confs, ids, frame_center_x)
+                                if new_id is not None:
+                                    target_id = new_id
+                                    print(f"🔄 目标超时，重新选定目标 ID: {target_id}")
+                                    target_lost_frames = 0
+                                    for i, tid in enumerate(ids):
+                                        if tid == target_id:
+                                            last_boxes = np.array([boxes_xyxy[i]])
+                                            last_scores = np.array([confs[i]])
+                                            prev_target_box = last_boxes[0]
+                                            break
+                                else:
+                                    target_id = None
+                                    last_boxes = []
+                                    last_scores = []
+                                    prev_target_box = None
+                else:
+                    last_boxes = boxes_xyxy
+                    last_scores = confs
+                    target_id = None
+                    prev_target_box = None
+            else:
+                all_boxes = []
+                all_scores = []
+                if target_id is not None:
+                    target_lost_frames += 1
+                    last_boxes = []
+                    if target_lost_frames > MAX_MISSED_FRAMES:
+                        print("🔄 目标完全消失，重置")
+                        target_id = None
+                        target_lost_frames = 0
+                        last_boxes = []
+                        last_scores = []
+                        prev_target_box = None
+                else:
+                    last_boxes = []
+                    last_scores = []
+
+        # ---------- 根据模式计算指令 ----------
+        if current_mode == MODE_AUTO:
+            if target_id is not None and len(last_boxes) > 0:
+                cmd_boxes = last_boxes
+            else:
+                cmd_boxes = []   # 无人或目标丢失，停止
+            cmd, value = calculate_command(cmd_boxes, frame_center_x)
+            if cmd == 'F':
+                cmd_str = f"F{value}"
+            elif cmd in ('L', 'R'):
+                cmd_str = f"{cmd}{value}"
+            else:
+                cmd_str = "S"
+            send_command(cmd_str)
+            current_cmd_display = cmd_str
+        else:
+            # 手动模式下，不自动发送指令，只显示“MANUAL”
+            current_cmd_display = "MANUAL"
+
+        # ---------- 读取下位机串口（电量、超声波等信息）----------
+        if ser and ser.is_open:
+            try:
+                while ser.in_waiting:
+                    line = ser.readline().decode().strip()
+                    if line.startswith("VOLT:"):
+                        battery_voltage = float(line[5:])
+                    elif line.startswith("US:"):
+                        try:
+                            ultrasonic_distance = float(line[3:])
+                        except:
+                            pass
+            except Exception as e:
+                # 忽略读取错误
+                pass
+
+        # ---------- 报警检查 ----------
+        # 1. 手动模式超时报警
+        if current_mode == MODE_MANUAL:
+            if (current_time - last_manual_cmd_time) > MANUAL_TIMEOUT_SEC and not manual_timeout_alarm_triggered:
+                send_bt_response("ALARM: MANUAL_TIMEOUT")
+                manual_timeout_alarm_triggered = True
+                print("⚠️ 报警：手动模式超时，切换至自动模式")
+                # 可选：自动切回自动模式（这里实现切换）
+                current_mode = MODE_AUTO
+        else:
+            manual_timeout_alarm_triggered = False  # 不在手动模式时重置
+
+        # 2. 超声波接近报警
+        if ultrasonic_distance is not None and ultrasonic_distance < ULTRASONIC_ALARM_DISTANCE:
+            if (current_time - last_ultrasonic_alarm_time) > ULTRASONIC_ALARM_COOLDOWN:
+                send_bt_response(f"ALARM: OBSTACLE {int(ultrasonic_distance)}cm")
+                last_ultrasonic_alarm_time = current_time
+                print(f"⚠️ 报警：障碍物 {int(ultrasonic_distance)}cm")
+
+        # ---------- 绘制画面 ----------
+        annotated = frame.copy()
+
+        # 绘制所有检测框（绿色）
+        if len(all_boxes) > 0:
+            for box, score in zip(all_boxes, all_scores):
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0,255,0), 2)
+                cv2.putText(annotated, f"person: {score:.2f}", (x1, y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+            cv2.putText(annotated, f"Total: {len(all_boxes)}", (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
+
+        # 绘制当前目标（红色实线框）
+        if target_id is not None and len(last_boxes) > 0:
+            for box in last_boxes:
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0,0,255), 3)
+                cv2.putText(annotated, f"Target ID: {target_id}", (x1, y1-30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+
+        if len(all_boxes) == 0:
+            cv2.putText(annotated, "No person detected", (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+        # 显示当前模式、电量、超声波距离
+        mode_text = "AUTO" if current_mode == MODE_AUTO else "MANUAL"
+        volt_text = f"{battery_voltage:.1f}V" if battery_voltage else "N/A"
+        us_text = f"{int(ultrasonic_distance)}cm" if ultrasonic_distance else "N/A"
+        cv2.putText(annotated, f"Mode: {mode_text}", (10, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+        cv2.putText(annotated, f"Batt: {volt_text}", (10, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+        cv2.putText(annotated, f"US: {us_text}", (10, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+
+        cv2.putText(annotated, f"Cmd: {current_cmd_display}", (10,70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+
+        with frame_lock:
+            current_frame = annotated
+
+        time.sleep(0.01)
+
+    cap.release()
+    if ser:
+        ser.close()
+    if bt_ser:
+        bt_ser.close()
+
+def generate_frames():
+    while True:
+        with frame_lock:
+            if current_frame is None:
+                continue
+            ret, jpeg = cv2.imencode('.jpg', current_frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            if not ret:
+                continue
+            frame_bytes = jpeg.tobytes()
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(STREAM_SLEEP)
+
+@app.route('/')
+def index():
+    # 动态生成 HTML，显示当前模式和电量、超声波
+    mode_str = "自动" if current_mode == MODE_AUTO else "手动"
+    volt_str = f"{battery_voltage:.1f}V" if battery_voltage else "未知"
+    us_str = f"{int(ultrasonic_distance)}cm" if ultrasonic_distance else "未知"
+    html = f'''
+    <!DOCTYPE html>
+    <html>
+    <head><title>树莓派智能跟随 - 蓝牙控制版（带报警）</title></head>
+    <body>
+        <h1>YOLOv8 多目标稳定跟踪 + 蓝牙手机控制 + 报警</h1>
+        <img src="/video_feed" style="max-width:100%">
+        <p>当前指令: {current_cmd_display}</p>
+        <p>当前模式: {mode_str}</p>
+        <p>超声波距离: {us_str}</p>
+        <p>绿色框为所有检测到的人，红色实线框为当前目标</p>
+        <hr>
+        <p><b>蓝牙指令说明：</b></p>
+        <ul>
+            <li><code>MODE_AUTO</code> - 切换为自动跟随模式</li>
+            <li><code>MODE_MANUAL</code> - 切换为手动控制模式</li>
+            <li><code>F200</code> / <code>L50</code> / <code>R80</code> / <code>S</code> - 手动模式下直接控制小车</li>
+        </ul>
+        <p><b>报警消息（通过蓝牙接收）：</b></p>
+        <ul>
+            <li><code>ALARM: MANUAL_TIMEOUT</code> - 手动模式超时（{MANUAL_TIMEOUT_SEC}秒无指令）</li>
+            <li><code>ALARM: OBSTACLE xxxcm</code> - 超声波检测到障碍物距离低于 {ULTRASONIC_ALARM_DISTANCE}cm</li>
+        </ul>
+    </body>
+    </html>
+    '''
+    return render_template_string(html)
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == '__main__':
+    # 启动蓝牙读取线程
+    bt_thread = threading.Thread(target=read_bt_commands, daemon=True)
+    bt_thread.start()
+
+    # 启动摄像头采集线程
+    t = threading.Thread(target=capture_frames, daemon=True)
+    t.start()
+
+    print("="*60)
+    print("服务启动成功！访问 http://<树莓派IP>:5000")
+    print("模型路径:", MODEL_PATH)
+    if 'TRACKER_CFG' in dir():
+        print("跟踪器配置:", TRACKER_CFG)
+    print("摄像头优化参数已启用，图像增强:", ENABLE_ENHANCE)
+    print("目标丢失立即停止，无虚线框")
+    print("蓝牙控制已启用（需确保系统已运行 rfcomm listener 服务）")
+    print("报警功能：手动超时 + 超声波避障")
+    print("="*60)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
