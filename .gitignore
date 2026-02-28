@@ -1,3 +1,37 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# 模型与大文件
+*.pt
+*.pth
+*.onnx
+*.weights
+*.mp4
+*.avi
+*.mov
+*.zip
+*.rar
+*.tar.gz
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.temp
+
+#  IDE
+.idea/
+.vscode/
+*.swp
+*.swo
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

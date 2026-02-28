@@ -1,0 +1,19 @@
+# 模型权重路径
+model_path: ./weights/best.pt
+
+# 摄像头/视频设置
+camera_index: 0  # 摄像头索引，0为默认摄像头
+video_path: ./demo.mp4  # 视频文件路径（可选）
+
+# 检测参数
+conf_threshold: 0.5  # 置信度阈值，大于此值才认为检测到目标
+iou_threshold: 0.45  # NMS阈值，用于去除重复检测框
+input_size: 640      # 输入图像尺寸
+
+# 跟踪器设置
+tracker_type: "bytetrack"  # 跟踪器类型
+enable_tracker: true        # 是否启用跟踪
+
+# 蓝牙串口设置
+bluetooth_port: "COM3"  # 蓝牙串口（根据你的实际端口修改）
+baud_rate: 9600          # 波特率
